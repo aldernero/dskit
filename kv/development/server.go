@@ -2,16 +2,17 @@ package main
 
 import (
 	"context"
-	"errors"
+	"flag"
 	"fmt"
 	"github.com/grafana/dskit/dns"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv/memberlist"
+	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
+	"net"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
+	"strconv"
 	"time"
 
 	"github.com/go-kit/log"
@@ -21,49 +22,47 @@ import (
 const (
 	defaultLocalAddress   = "127.0.0.1"
 	defaultMemberlistPort = 7946
-	defaultServerPort     = 8080
+	defaultServerPort     = 8100
 )
 
-type config struct {
-	BindAddr string
-	BindPort int
-}
+func main() {
+	var bindaddr string
+	var bindport int
+	var joinmember string
 
-type server struct {
-	cfg        config
-	kv         *memberlist.KV
-	httpServer *http.Server
-	logger     *log.Logger
-}
+	flag.StringVar(&bindaddr, "bindaddr", defaultLocalAddress, "bindaddr for this specific peer")
+	flag.IntVar(&bindport, "bindport", defaultMemberlistPort, "bindport for this specific peer")
+	flag.StringVar(&joinmember, "join-member", "", "peer addr that is part of existing cluster")
 
-func newServer(cfg config) *server {
-	router := http.NewServeMux()
-	router.HandleFunc("GET /", defaultHandler)            // show entire key-value store
-	router.HandleFunc("GET /{key}", getItemHandler)       // get value for key
-	router.HandleFunc("POST /{key}", postItemHandler)     // create new key-value pair
-	router.HandleFunc("PUT /{key}", putItemHandler)       // update value for key
-	router.HandleFunc("DELETE /{key}", deleteItemHandler) // delete key-value pair
+	flag.Parse()
 
-	srv := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.BindPort),
-		Handler: router,
-	}
-
+	ctx := context.Background()
 	logger := log.With(log.NewLogfmtLogger(os.Stdout), level.AllowDebug())
 
+	joinmembers := make([]string, 0)
+	if joinmember != "" {
+		joinmembers = append(joinmembers, joinmember)
+	}
+
 	var mbConfig memberlist.KVConfig
-	flagext.DefaultValues(&cfg)
+	flagext.DefaultValues(&mbConfig)
+
+	// non-default options
+	mbConfig.RandomizeNodeName = false
+	mbConfig.ClusterLabel = "cluster"
+	mbConfig.MessageHistoryBufferBytes = 1024 * 1024 * 10
 
 	mbConfig.TCPTransport = memberlist.TCPTransportConfig{
-		BindAddrs: []string{bindAddr},
-		BindPort:  bindPort,
+		BindAddrs:      []string{bindaddr},
+		BindPort:       bindport,
+		TransportDebug: true,
 	}
 	// joinmembers are the addresses of peers who are already in the memberlist group.
 	// Usually provided if this peer is trying to join an existing cluster.
 	// Generally you start the very first peer without `joinmembers`, but start all
 	// other peers with at least one `joinmembers`.
-	if len(joinmembers) > 0 {
-		cfg.JoinMembers = joinmembers
+	if len(joinmember) > 0 {
+		mbConfig.JoinMembers = joinmembers
 	}
 
 	// resolver defines how each peers IP address should be resolved.
@@ -73,36 +72,33 @@ func newServer(cfg config) *server {
 	mbConfig.NodeName = bindaddr
 	mbConfig.StreamTimeout = 5 * time.Second
 
-	return &server{
-		cfg:        cfg,
-		kv:         kv,
-		httpServer: srv,
-		logger:     logger,
+	kvSvc := memberlist.NewKVInitService(&mbConfig, log.With(logger, "component", "memberlist"), resolver, prometheus.NewPedanticRegistry())
+	if err := services.StartAndAwaitRunning(ctx, kvSvc); err != nil {
+		panic(err)
 	}
-}
+	defer services.StopAndAwaitTerminated(ctx, kvSvc)
 
-func main() {
-	cfg := config{
-		BindAddr: defaultLocalAddress,
-		BindPort: defaultServerPort,
+	_, err := kvSvc.GetMemberlistKV()
+	if err != nil {
+		panic(err)
 	}
 
-	srv := newServer(cfg)
-
-	stopChan := make(chan os.Signal, 1)
-	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		if err := srv.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server failed to start: %v", err)
-		}
-	}()
-
-	<-stopChan
-
-	if err := srv.httpServer.Shutdown(context.Background()); err != nil {
-		log.Fatalf("server failed to shutdown: %v", err)
+	listener, err := net.Listen("tcp", net.JoinHostPort(bindaddr, strconv.Itoa(defaultServerPort)))
+	if err != nil {
+		panic(err)
 	}
+
+	fmt.Println("listening on ", listener.Addr())
+
+	router := http.NewServeMux()
+	router.Handle("GET /", kvSvc)                         // show entire key-value store
+	router.HandleFunc("GET /{key}", getItemHandler)       // get value for key
+	router.HandleFunc("POST /{key}", postItemHandler)     // create new key-value pair
+	router.HandleFunc("PUT /{key}", putItemHandler)       // update value for key
+	router.HandleFunc("DELETE /{key}", deleteItemHandler) // delete key-value pair
+
+	panic(http.Serve(listener, router))
+
 }
 
 func deleteItemHandler(writer http.ResponseWriter, request *http.Request) {
